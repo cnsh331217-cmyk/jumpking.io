@@ -1,0 +1,742 @@
+import pygame
+import sys
+import random
+import math
+import os
+
+# 1. 초기화 및 설정
+pygame.init()
+pygame.mixer.init()  # 오디오 믹서 초기화
+
+GAME_W, GAME_H = 150, 200  
+SCALE = 4                  
+DISP_W, DISP_H = GAME_W * SCALE, GAME_H * SCALE 
+
+screen = pygame.display.set_mode((DISP_W, DISP_H))
+game_surface = pygame.Surface((GAME_W, GAME_H))
+pygame.display.set_caption("성벽 점프킹 - 레이저 400m 조정판")
+clock = pygame.time.Clock()
+
+# ================= [ 🎵 사운드 로딩 ] =================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+try:
+    pygame.mixer.music.load(os.path.join(BASE_DIR, "bgm.mp3"))
+    pygame.mixer.music.set_volume(0.4)
+    pygame.mixer.music.play(-1)
+    
+    jump_sound = pygame.mixer.Sound(os.path.join(BASE_DIR, "jump.WAV"))
+    jump_sound.set_volume(0.6)
+
+    die_sound = pygame.mixer.Sound(os.path.join(BASE_DIR, "die.wav"))
+    die_sound.set_volume(0.6)
+    
+    clear_sound = pygame.mixer.Sound(os.path.join(BASE_DIR, "clear.WAV"))
+    clear_sound.set_volume(0.6)
+    
+    print("사운드 파일을 성공적으로 불러왔습니다!")
+except pygame.error as e:
+    print("⚠️ 사운드 파일 로드 중 일부 오류가 있거나 파일이 없습니다. 안전 모드로 시작합니다.")
+    jump_sound = None
+    die_sound = None
+    clear_sound = None
+# =======================================================================
+
+# 색상 팔레트
+WHITE = (240, 240, 240)
+BLACK = (10, 10, 15)
+YELLOW = (255, 255, 0) 
+GREEN = (50, 220, 50)  
+LAVA_COLOR = (255, 50, 0) 
+NORMAL_COLOR = (80, 85, 90)              
+ICE_COLOR = (50, 200, 255)               
+ILLUSION_COLOR = (150, 50, 250)          
+MOVING_PLAT_COLOR = (230, 120, 0)        
+BOUNCE_COLOR = (255, 0, 100)             
+HAZARD_COLOR = (180, 0, 0)               
+LASER_HOT = (255, 0, 0)                  
+
+# 게임 상수
+SCALE_F = 1.0 / SCALE 
+GRAVITY = 0.7 * SCALE_F
+MAX_FALL_SPEED = 16 * SCALE_F
+MAX_JUMP_CHARGE = 28 * SCALE_F
+CHARGE_RATE = 1.3 * SCALE_F
+MOVE_SPEED = 7 * SCALE_F
+ICE_MOVE_SPEED = 1.6 * SCALE_F
+ICE_FRICTION = 0.982      
+AIR_ACCEL = 0.4 * SCALE_F
+JUMP_X_SPEED = 9 * SCALE_F
+LAVA_START_HEIGHT = 15 
+
+# 골인 지점을 250m 상공으로 하향 조정
+ROOFTOP_Y = (GAME_H - (140 * SCALE_F)) - (250 * 20 * SCALE_F) 
+
+best_score = 0
+STARS = [] 
+global_pressed_buttons = set()
+last_trap_type = None # 연속된 함정을 방지하기 위한 전역 변수
+
+def draw_background(surface, camera_y):
+    surface.fill((5, 10, 25)) 
+    for sx, sy in STARS:
+        if -2 < sy - camera_y < GAME_H + 2:
+            surface.set_at((int(sx), int(sy - camera_y)), WHITE)
+
+    brick_w, brick_h = 25, 12 
+    start_row = int(camera_y // brick_h) - 1
+    end_row = int((camera_y + GAME_H) // brick_h) + 2
+    
+    for row in range(start_row, end_row):
+        y_world = row * brick_h
+        if y_world >= ROOFTOP_Y: 
+            y_screen = y_world - camera_y
+            offset_x = (row % 2) * (brick_w // 2)
+            
+            for col in range(-1, GAME_W // brick_w + 2):
+                x = col * brick_w - offset_x
+                wall_col = (45, 50, 55) if row % 2 == 0 else (50, 55, 60)
+                pygame.draw.rect(surface, wall_col, (x, y_screen, brick_w-1, brick_h-1))
+                if (row * 37 + col * 17) % 100 < 8: 
+                    pygame.draw.rect(surface, (15, 20, 35), (x+5, y_screen+3, brick_w-11, brick_h-7))
+                    surface.set_at((int(x+7), int(y_screen+5)), (200, 200, 100))
+
+    roof_screen_y = ROOFTOP_Y - camera_y
+    if -10 < roof_screen_y < GAME_H:
+        for px in range(0, GAME_W, 15):
+            if px < GAME_W//2 - 25 or px > GAME_W//2 + 15:
+                pygame.draw.rect(surface, (60, 65, 70), (px, roof_screen_y - 8, 10, 8))
+        pygame.draw.rect(surface, NORMAL_COLOR, (0, roof_screen_y, GAME_W//2 - 25, 3))
+        pygame.draw.rect(surface, NORMAL_COLOR, (GAME_W//2 + 25, roof_screen_y, GAME_W//2 - 25, 3))
+
+# ================= [ 플랫폼 및 트랩 클래스 ] =================
+P_THICK = 25 * SCALE_F 
+
+class BasePlatform(pygame.sprite.Sprite):
+    def __init__(self, px, py, pw, ph, color, flat_top=False):
+        super().__init__()
+        self.image = pygame.Surface((pw, ph), pygame.SRCALPHA)
+        self.image.fill(color)
+        if flat_top: 
+            pygame.draw.line(self.image, GREEN, (0, 0), (pw, 0), 1)
+        self.rect = self.image.get_rect(topleft=(px, py))
+        self.mask = pygame.mask.from_surface(self.image)
+        self.is_slippery = False
+        self.is_illusion = False
+        self.is_hazard = False
+        self.is_moving = False
+
+class Platform(BasePlatform):
+    def __init__(self, px, py, pw): 
+        super().__init__(px, py, pw, int(P_THICK), NORMAL_COLOR, flat_top=True)
+
+class SlipperyPlatform(BasePlatform):
+    def __init__(self, px, py, pw):
+        super().__init__(px, py, pw, int(P_THICK), ICE_COLOR, flat_top=True)
+        self.is_slippery = True
+
+class IllusionPlatform(BasePlatform):
+    def __init__(self, px, py, pw):
+        super().__init__(px, py, pw, int(P_THICK), (0,0,0,0), flat_top=True)
+        self.is_illusion = True
+        self.is_active = True
+        self.vanish_timer = 0
+        self.reappear_timer = 0
+        self.raw_color = ILLUSION_COLOR
+        self.w = pw
+        self.h = int(P_THICK)
+        self.redraw(150)
+        
+    def redraw(self, alpha):
+        self.image.fill((0,0,0,0))
+        img = pygame.Surface((self.w, self.h))
+        img.fill(self.raw_color)
+        img.set_alpha(alpha)
+        self.image.blit(img, (0,0))
+        pygame.draw.line(self.image, GREEN, (0, 0), (self.w, 0), 1)
+
+    def step_on(self):
+        if self.is_active and self.vanish_timer == 0: 
+            self.vanish_timer = 60
+            
+    def update(self):
+        if self.is_active:
+            if self.vanish_timer > 0:
+                self.vanish_timer -= 1
+                if self.vanish_timer < 20 and self.vanish_timer % 8 == 0: 
+                    self.redraw(50)
+                else: 
+                    self.redraw(150)
+                if self.vanish_timer == 0:
+                    self.is_active = False
+                    self.reappear_timer = 150
+                    self.redraw(0)
+        else:
+            self.reappear_timer -= 1
+            if self.reappear_timer <= 0:
+                self.is_active = True
+                self.vanish_timer = 0
+                self.redraw(150)
+
+class MovingPlatform(BasePlatform):
+    def __init__(self, py, pw):
+        max_x = max(0, GAME_W - pw)
+        super().__init__(random.randint(0, max_x), py, pw, int(P_THICK), MOVING_PLAT_COLOR, flat_top=True)
+        self.is_moving = True
+        self.direction = random.choice([-1, 1])
+        self.speed = random.uniform(0.6, 1.2)
+        self.exact_x = float(self.rect.x)
+        
+    def update(self):
+        self.exact_x += self.direction * self.speed
+        self.rect.x = int(self.exact_x)
+        if self.rect.right > GAME_W or self.rect.left < 0: 
+            self.direction *= -1
+            self.exact_x += self.direction * self.speed * 2
+
+class FloatingBouncer(BasePlatform):
+    def __init__(self, px, py):
+        radius = random.randint(4, 6)
+        super().__init__(px, py, radius*2, radius*2, (0,0,0,0))
+        self.is_hazard = True
+        pygame.draw.circle(self.image, BOUNCE_COLOR, (radius, radius), radius)
+        pygame.draw.circle(self.image, WHITE, (radius, radius), radius, 1)
+        self.mask = pygame.mask.from_surface(self.image)
+
+class MovingHazard(BasePlatform):
+    def __init__(self, py):
+        radius = 5
+        super().__init__(random.randint(0, GAME_W-radius*2), py, radius*2, radius*2, (0,0,0,0))
+        self.is_hazard = True
+        self.direction = random.choice([-1, 1])
+        self.speed = random.uniform(1.0, 1.8)
+        self.exact_x = float(self.rect.x) 
+        self.image.fill(HAZARD_COLOR)
+        pygame.draw.rect(self.image, BLACK, (1, 1, radius*2-2, radius*2-2), 1)
+        self.image.set_at((int(radius), int(radius)), WHITE)
+        self.mask = pygame.mask.from_surface(self.image)
+        
+    def update(self):
+        self.exact_x += self.direction * self.speed
+        self.rect.x = int(self.exact_x)
+        if self.rect.right > GAME_W or self.rect.left < 0: 
+            self.direction *= -1
+            self.exact_x += self.direction * self.speed * 2
+
+class Laser(BasePlatform):
+    def __init__(self, py):
+        super().__init__(0, py, GAME_W, 4, (0,0,0,0))
+        self.is_hazard = True
+        self.hazard_type = "laser"
+        self.timer = random.randint(0, 120)
+        self.state = 0
+        
+    def update(self):
+        self.timer += 1
+        self.image.fill((0,0,0,0))
+        if self.state == 0:
+            if self.timer > 90: 
+                self.state = 1
+                self.timer = 0
+        elif self.state == 1:
+            for x in range(0, GAME_W, 4): 
+                pygame.draw.rect(self.image, (255, 100, 100, 180), (x, 1, 2, 2))
+            if self.timer > 40: 
+                self.state = 2
+                self.timer = 0
+        elif self.state == 2:
+            self.image.fill(LASER_HOT)
+            pygame.draw.rect(self.image, WHITE, (0, 1, GAME_W, 2))
+            if self.timer > 60: 
+                self.state = 0
+                self.timer = 0
+        self.mask = pygame.mask.from_surface(self.image)
+
+# 3D 키캡 피젯 토이 디자인 (파란 머리, 흰색 몸통 유지)
+class Keycap(pygame.sprite.Sprite):
+    def __init__(self, px, py):
+        super().__init__()
+        self.image = pygame.Surface((16, 20), pygame.SRCALPHA)
+        pygame.draw.rect(self.image, (210, 215, 220), (2, 10, 12, 8), border_radius=2)
+        pygame.draw.rect(self.image, (180, 185, 190), (2, 10, 12, 8), 1, border_radius=2)
+        pygame.draw.rect(self.image, (220, 40, 40), (6, 7, 4, 3))
+        pygame.draw.polygon(self.image, (0, 100, 200), [(0, 7), (16, 7), (14, 2), (2, 2)])
+        pygame.draw.polygon(self.image, (0, 180, 255), [(2, 2), (14, 2), (12, 0), (4, 0)])
+        pygame.draw.line(self.image, (255, 255, 255), (2, 2), (14, 2), 1)
+        pygame.draw.line(self.image, (20, 25, 30), (0, 7), (16, 7), 1)
+        
+        self.rect = self.image.get_rect(topleft=(px, py))
+        self.mask = pygame.mask.from_surface(self.image)
+        self.is_keycap = True
+
+class SwitchButton(BasePlatform):
+    def __init__(self, px, py, b_id, align="left"):
+        super().__init__(px, py, 12, 24, (0,0,0,0))
+        self.b_id = b_id
+        self.align = align
+        self.is_button = True
+        self.is_pressed = (b_id in global_pressed_buttons)
+        self.draw_button()
+
+    def draw_button(self):
+        self.image.fill((0,0,0,0))
+        color = (50, 200, 50) if self.is_pressed else (255, 50, 50)
+        w = 6 if self.is_pressed else 12 
+        
+        if self.align == "left":
+            pygame.draw.rect(self.image, color, (0, 0, w, 24))
+            pygame.draw.rect(self.image, WHITE, (0, 0, w, 24), 2)
+        else: 
+            offset = 12 - w
+            pygame.draw.rect(self.image, color, (offset, 0, w, 24))
+            pygame.draw.rect(self.image, WHITE, (offset, 0, w, 24), 2)
+            
+        self.mask = pygame.mask.from_surface(self.image)
+
+    def press(self):
+        if not self.is_pressed:
+            self.is_pressed = True
+            self.draw_button() 
+            global_pressed_buttons.add(self.b_id)
+
+class Gate(BasePlatform):
+    def __init__(self, py):
+        super().__init__(0, py, GAME_W, 30, (80, 20, 20))
+        self.is_gate = True
+        pygame.draw.rect(self.image, BLACK, (0, 0, GAME_W, 30), 2)
+        pygame.draw.rect(self.image, (255, 200, 0), (GAME_W//2 - 15, 5, 30, 20))
+
+    def update(self):
+        if len(global_pressed_buttons) >= 3:
+            self.rect.x = -9999 
+
+class Goal(BasePlatform):
+    def __init__(self, py):
+        super().__init__(GAME_W//2 - 20, py, 40, 40, (0,0,0,0))
+        self.is_goal = True
+        pygame.draw.circle(self.image, YELLOW, (20, 20), 18)
+        pygame.draw.circle(self.image, WHITE, (20, 20), 12)
+        pygame.draw.circle(self.image, (150, 255, 255), (20, 20), 6)
+        self.mask = pygame.mask.from_surface(self.image)
+
+# ================= [ 도트 캐릭터 로직 ] =================
+class Player(pygame.sprite.Sprite):
+    def __init__(self, x, y):
+        super().__init__()
+        self.pw, self.ph = 8, 10 
+        self.image = pygame.Surface((self.pw, self.ph), pygame.SRCALPHA)
+        self.redraw_sprite(False, 0)
+        
+        self.rect = self.image.get_rect(topleft=(x, y))
+        self.mask = pygame.mask.from_surface(self.image)
+        self.x = float(x)
+        self.y = float(y)
+        self.vel_x = 0
+        self.vel_y = 0
+        self.charge = 0
+        self.on_ground = False
+        self.is_charging = False
+        self.on_slippery = False
+
+    def redraw_sprite(self, jumping, charge_pct):
+        self.image.fill((0,0,0,0))
+        body_col = (220, 30, 30) 
+        body_h = self.ph - int(2 * charge_pct)
+        body_y = self.ph - body_h
+        
+        pygame.draw.rect(self.image, body_col, (1, body_y, self.pw-2, body_h))
+        pygame.draw.rect(self.image, BLACK, (1, body_y, self.pw-2, body_h), 1)
+        eye_col = YELLOW if not jumping else WHITE
+        self.image.set_at((2, body_y+3), eye_col)
+        self.image.set_at((5, body_y+3), eye_col)
+        if charge_pct > 0.5: 
+            pygame.draw.rect(self.image, body_col, (2, body_y+2, 4, 1))
+
+    def update(self, platforms, keys):
+        for obs in platforms:
+            if getattr(obs, 'is_keycap', False):
+                if self.rect.colliderect(obs.rect):
+                    obs.rect.x = -9999
+                    obs.kill()
+
+        if self.on_ground:
+            if self.on_slippery: 
+                self.vel_x *= ICE_FRICTION
+            if keys[pygame.K_SPACE]:
+                self.is_charging = True
+                if not self.on_slippery: 
+                    self.vel_x = 0
+                self.charge = min(MAX_JUMP_CHARGE, self.charge + CHARGE_RATE)
+            else:
+                if self.is_charging: 
+                    self.vel_y = -self.charge
+                    if keys[pygame.K_LEFT]: self.vel_x = -JUMP_X_SPEED
+                    elif keys[pygame.K_RIGHT]: self.vel_x = JUMP_X_SPEED
+                    if self.on_slippery: 
+                        self.vel_x += self.vel_x * 0.2
+                    self.is_charging = False
+                    self.charge = 0
+                    self.on_ground = False
+                    
+                    if jump_sound:
+                        jump_sound.play()
+                else: 
+                    current_move_speed = ICE_MOVE_SPEED if self.on_slippery else MOVE_SPEED
+                    if keys[pygame.K_LEFT]: self.vel_x = -current_move_speed
+                    elif keys[pygame.K_RIGHT]: self.vel_x = current_move_speed
+                    else:
+                        if not self.on_slippery: 
+                            self.vel_x = 0
+        else: 
+            if keys[pygame.K_LEFT]: self.vel_x -= AIR_ACCEL
+            elif keys[pygame.K_RIGHT]: self.vel_x += AIR_ACCEL
+            self.vel_y = min(MAX_FALL_SPEED, self.vel_y + GRAVITY)
+            self.vel_x *= 0.95 
+
+        self.redraw_sprite(not self.on_ground, self.charge / MAX_JUMP_CHARGE)
+
+        self.y += self.vel_y
+        self.rect.y = int(self.y)
+        self.on_ground = False
+        self.on_slippery = False
+        
+        for obs in platforms:
+            if getattr(obs, 'is_keycap', False): continue
+            if obs.is_illusion and not obs.is_active: continue
+            if self.rect.colliderect(obs.rect) and self.mask.overlap(obs.mask, (obs.rect.x - self.rect.x, obs.rect.y - self.rect.y)):
+                
+                if getattr(obs, 'is_button', False): obs.press()
+                if getattr(obs, 'is_goal', False): return "CLEAR"
+
+                if obs.is_hazard:
+                    if getattr(obs, 'hazard_type', '') == 'laser':
+                        if obs.state == 2: return "DEAD" 
+                        continue
+                    self.vel_y = 8 * SCALE_F 
+                    self.vel_x = 12 * SCALE_F if (self.rect.centerx - obs.rect.centerx) > 0 else -12 * SCALE_F
+                    self.is_charging = False
+                    self.charge = 0
+                    continue
+
+                if self.vel_y > 0: 
+                    while self.mask.overlap(obs.mask, (obs.rect.x - self.rect.x, obs.rect.y - self.rect.y)): 
+                        self.rect.y -= 1
+                    self.y = self.rect.y
+                    self.vel_y = 0
+                    self.on_ground = True
+                    self.on_slippery = obs.is_slippery
+                    if obs.is_moving: 
+                        self.x += obs.direction * obs.speed 
+                    if obs.is_illusion: 
+                        obs.step_on()
+                elif self.vel_y < 0: 
+                    while self.mask.overlap(obs.mask, (obs.rect.x - self.rect.x, obs.rect.y - self.rect.y)): 
+                        self.rect.y += 1
+                    self.y = self.rect.y
+                    self.vel_y = -self.vel_y * 0.3
+
+        self.x += self.vel_x
+        self.rect.x = int(self.x)
+        if self.x < 0: 
+            self.x = 0
+            self.vel_x = -self.vel_x * 0.8
+        elif self.x > GAME_W - self.pw: 
+            self.x = GAME_W - self.pw
+            self.vel_x = -self.vel_x * 0.8
+            
+        for obs in platforms:
+            if getattr(obs, 'is_keycap', False): continue
+            if obs.is_illusion and not obs.is_active: continue
+            if obs.is_hazard: continue
+            if self.rect.colliderect(obs.rect) and self.mask.overlap(obs.mask, (obs.rect.x - self.rect.x, obs.rect.y - self.rect.y)):
+                if getattr(obs, 'is_goal', False): return "CLEAR"
+                if self.vel_x > 0:
+                    while self.mask.overlap(obs.mask, (obs.rect.x - self.rect.x, obs.rect.y - self.rect.y)): 
+                        self.rect.x -= 1
+                elif self.vel_x < 0:
+                    while self.mask.overlap(obs.mask, (obs.rect.x - self.rect.x, obs.rect.y - self.rect.y)): 
+                        self.rect.x += 1
+                self.exact_x = float(self.rect.x)
+                self.vel_x = -self.vel_x * 0.8
+        return None
+
+# ================= [ 맵 생성 로직 ] =================
+def get_platforms_for_block(block_y, map_seed):
+    global last_trap_type
+    random.seed(block_y + map_seed)
+    group = pygame.sprite.Group()
+    block_score = max(0, (GAME_H - (140 * SCALE_F) - block_y) // (20 * SCALE_F))
+    
+    def score_to_y(s): 
+        return GAME_H - (140 * SCALE_F) - (s * 20 * SCALE_F)
+
+    # 📌 [수정] 천장 공간을 완전히 확보하기 위해 세 번째 버튼 높이를 위로 대폭 이동 (230m -> 236m)
+    b1_y = score_to_y(215)  # 1번 버튼 (왼쪽)
+    b2_y = score_to_y(225)  # 2번 버튼 (오른쪽)
+    b3_y = score_to_y(236)  # 3번 버튼 (왼쪽 - 이제 1번 버튼 위가 뻥 뚫려 점프가 잘 됩니다)
+    
+    gate_y = score_to_y(256)
+    s4_y = score_to_y(255)
+    s5_y = score_to_y(258)
+    ceil_y = score_to_y(262)
+    goal_y = score_to_y(266)
+
+    # 150m 지점 3D 키캡 배치 및 발판
+    keycap_y = score_to_y(150)
+    if block_y <= keycap_y < block_y + GAME_H:
+        group.add(Keycap(GAME_W // 2 - 8, keycap_y - 20))
+        group.add(Platform(GAME_W // 2 - 20, keycap_y, 40))
+
+    # 📌 [수정] 버튼들 사이의 불필요한 중간 발판들(s1_y, s2_y, s3_y)을 완전히 제거했습니다.
+    if block_y <= b1_y < block_y + GAME_H: 
+        group.add(SwitchButton(0, b1_y, 1, align="left")) 
+        group.add(Platform(0, b1_y + 24, 30)) 
+        
+    if block_y <= b2_y < block_y + GAME_H: 
+        group.add(SwitchButton(GAME_W - 12, b2_y, 2, align="right")) 
+        group.add(Platform(GAME_W - 25, b2_y + 24, 30)) 
+        
+    if block_y <= b3_y < block_y + GAME_H: 
+        group.add(SwitchButton(0, b3_y, 3, align="left")) 
+        group.add(Platform(0, b3_y + 24, 60)) 
+        
+    if block_y <= gate_y < block_y + GAME_H: 
+        group.add(Gate(gate_y))
+        group.add(Platform(0, gate_y + 35, GAME_W // 2 - 20)) 
+        group.add(Platform(GAME_W // 2 + 20, gate_y + 35, GAME_W // 2 - 20)) 
+        
+    if block_y <= s4_y < block_y + GAME_H: 
+        group.add(Platform(20, s4_y, 40))
+    if block_y <= s5_y < block_y + GAME_H: 
+        group.add(Platform(GAME_W - 60, s5_y, 40))
+        
+    if block_y <= ceil_y < block_y + GAME_H: 
+        group.add(Platform(0, ceil_y, GAME_W//2 - 25))        
+        group.add(Platform(GAME_W//2 + 25, ceil_y, GAME_W//2 - 25)) 
+        
+    if block_y <= goal_y < block_y + GAME_H: 
+        group.add(Goal(goal_y))
+
+    if block_score >= 265: 
+        return group
+
+    step_h = 35 
+    pw_min, pw_max = 35, 45 
+
+    if block_score < 50:
+        p_move = 0.0
+        p_ice = 0.0
+        p_hazard = 0.0
+        p_illu = 0.0
+        laser_chance = 0.0
+        floater_max = 0
+    else:
+        p_move = 0.15        
+        p_ice = 0.15         
+        p_hazard = 0.10      
+        p_illu = 0.10        
+        laser_chance = 0.15  
+        floater_max = 2      
+
+    if floater_max > 0 and block_score < 210:
+        for _ in range(random.randint(0, floater_max)): 
+            by = block_y + random.randint(15, GAME_H-15)
+            if abs(by - score_to_y(150)) < 35 or by <= score_to_y(210):
+                continue
+            group.add(FloatingBouncer(random.randint(15, GAME_W-15), by))
+
+    if random.random() < laser_chance and block_score < 210: 
+        ly = block_y + random.randint(25, GAME_H-25)
+        if abs(ly - score_to_y(150)) < 35 or ly <= score_to_y(210):
+            pass
+        else:
+            group.add(Laser(ly))
+
+    p_norm = 1.0 - (p_illu + p_move + p_hazard + p_ice)
+    t_norm = p_norm
+    t_illu = t_norm + p_illu
+    t_move = t_illu + p_move
+    t_ice = t_move + p_ice
+
+    for y_base in range(block_y + GAME_H - 12, block_y + 25, -step_h):
+        py = y_base + random.randint(-4, 4)
+        if py <= score_to_y(260): continue
+        if score_to_y(260) < py <= score_to_y(210): continue 
+        
+        if abs(py - score_to_y(150)) < 35: continue
+
+        pw = random.randint(pw_min, pw_max)
+        px = random.randint(10, max(11, GAME_W - 10 - pw))
+        
+        c = random.random()
+        selected_type = 'normal'
+        if c < t_norm: selected_type = 'normal'
+        elif c < t_illu: selected_type = 'illusion'
+        elif c < t_move: selected_type = 'moving'
+        elif c < t_ice: selected_type = 'ice'
+        else: selected_type = 'hazard'
+        
+        if selected_type != 'normal':
+            if selected_type == last_trap_type:
+                selected_type = 'normal' 
+                last_trap_type = None    
+            else:
+                last_trap_type = selected_type
+        else:
+            last_trap_type = None
+
+        if selected_type == 'normal': 
+            group.add(Platform(px, py, pw))
+        elif selected_type == 'illusion': 
+            group.add(IllusionPlatform(px, py, pw))
+        elif selected_type == 'moving': 
+            group.add(MovingPlatform(py, pw))
+        elif selected_type == 'ice': 
+            group.add(SlipperyPlatform(px, py, pw))
+        elif selected_type == 'hazard': 
+            group.add(MovingHazard(py))
+        
+    random.seed() 
+    return group
+
+def reset_game(): 
+    global STARS, global_pressed_buttons, last_trap_type
+    STARS = [(random.randint(0, GAME_W), random.randint(-5000, int(ROOFTOP_Y))) for _ in range(400)]
+    global_pressed_buttons.clear() 
+    last_trap_type = None 
+    new_map_seed = random.randint(0, 1000000)
+    return Player(GAME_W // 2, GAME_H - (140*SCALE_F)), 0, GAME_H + 200*SCALE_F, False, False, False, new_map_seed, {}
+
+player, camera_y, lava_y, game_over, game_clear, lava_active, map_seed, chunk_cache = reset_game()
+
+font = pygame.font.Font(None, 40)
+small_font = pygame.font.Font(None, 24)
+
+# ================= [ 메인 루프 ] =================
+while True:
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT: 
+            pygame.quit()
+            sys.exit()
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_r: 
+            player, camera_y, lava_y, game_over, game_clear, lava_active, map_seed, chunk_cache = reset_game()
+            try:
+                if clear_sound:
+                    clear_sound.stop()
+                pygame.mixer.music.play(-1)
+            except:
+                pass
+
+    if not game_over and not game_clear:
+        keys = pygame.key.get_pressed()
+        camera_y += ((player.y - GAME_H * 0.65) - camera_y) * 0.1
+        score = int(max(0, GAME_H - (140*SCALE_F) - player.y) // (20*SCALE_F))
+        if score > best_score: 
+            best_score = score
+
+        if not lava_active and score >= LAVA_START_HEIGHT: 
+            lava_active = True
+        if lava_active and score < 240: 
+            lava_y -= (1.5 + (max(0, abs(player.y)) / 10000)) * SCALE_F
+
+        current_block = (int(camera_y) // GAME_H) * GAME_H
+        all_platforms = pygame.sprite.Group()
+        for offset in [-GAME_H, 0, GAME_H]: 
+            block_y = current_block + offset
+            if block_y not in chunk_cache: 
+                chunk_cache[block_y] = get_platforms_for_block(block_y, map_seed)
+            all_platforms.add(chunk_cache[block_y])
+        
+        floor = BasePlatform(0, GAME_H-(100*SCALE_F), GAME_W, 100*SCALE_F, NORMAL_COLOR, flat_top=True)
+        obs_list = all_platforms.sprites()
+        
+        if player.y > GAME_H - (200 * SCALE_F):
+            obs_list.append(floor)
+
+        all_platforms.update()
+        
+        update_status = player.update(obs_list, keys)
+        
+        if update_status == "DEAD": 
+            if not game_over:
+                if die_sound: 
+                    die_sound.play()
+                pygame.mixer.music.stop()
+            game_over = True 
+        elif update_status == "CLEAR": 
+            if not game_clear:
+                pygame.mixer.music.stop()
+                if clear_sound:
+                    clear_sound.play()
+            game_clear = True
+        
+        if player.rect.bottom > lava_y: 
+            if not game_over:
+                if die_sound: 
+                    die_sound.play()
+                pygame.mixer.music.stop()
+            game_over = True 
+
+    # ---- 렌더링 & 사운드 제어 ----
+    draw_background(game_surface, camera_y)
+    
+    for obs in all_platforms: 
+        game_surface.blit(obs.image, (obs.rect.x, obs.rect.y - camera_y))
+    if camera_y > -GAME_H: 
+        game_surface.blit(floor.image, (0, GAME_H-(100*SCALE_F) - camera_y))
+    
+    lava_scr_y = lava_y - camera_y
+    if lava_scr_y < GAME_H:
+        pygame.draw.rect(game_surface, LAVA_COLOR, (0, lava_scr_y, GAME_W, GAME_H))
+        bub_off = (pygame.time.get_ticks() // 150) % 2
+        for x in range(bub_off * 4, GAME_W, 8): 
+            pygame.draw.rect(game_surface, (255, 100, 0), (x, lava_scr_y-2, 4, 2))
+
+    p_pos = (player.rect.x, player.rect.y - camera_y)
+    game_surface.blit(player.image, p_pos)
+    
+    if player.is_charging: 
+        bar_w = int((player.charge/MAX_JUMP_CHARGE)*player.pw)
+        pygame.draw.rect(game_surface, YELLOW, (p_pos[0], p_pos[1]-3, bar_w, 2))
+
+    scaled_surface = pygame.transform.scale(game_surface, (DISP_W, DISP_H))
+    screen.blit(scaled_surface, (0, 0))
+    
+    screen.blit(font.render(f"Height: {score}m", True, WHITE), (20, 20))
+    screen.blit(font.render(f"Best: {best_score}m", True, YELLOW), (20, 60))
+    
+    if score >= 200 and not game_clear: 
+        key_color = GREEN if len(global_pressed_buttons) == 3 else YELLOW
+        screen.blit(font.render(f"KEYS: {len(global_pressed_buttons)} / 3", True, key_color), (DISP_W//2 - 70, 100))
+    elif not lava_active: 
+        screen.blit(small_font.render(f"Lava wakes up at {LAVA_START_HEIGHT}m", True, (200, 200, 200)), (20, 100))
+    elif score < 200: 
+        nxt = "Fidget Keycap at 150m!" if score < 150 else "End Puzzle Gate at 215m"
+        screen.blit(small_font.render(f"Next: {nxt}", True, (255, 150, 150)), (20, 100))
+
+    if game_over or game_clear:
+        overlay = pygame.Surface((DISP_W, DISP_H), pygame.SRCALPHA)
+        if game_clear: 
+            overlay.fill((255, 255, 255, 50)) 
+        else: 
+            overlay.fill((0, 0, 0, 200))
+        screen.blit(overlay, (0,0))
+        
+        if game_clear:
+            t = pygame.time.get_ticks()
+            flash_color = (255, 200 + int(math.sin(t/100)*55), 50)
+            y_bounce = int(math.sin(t/150) * 10)
+            
+            msg1 = font.render("🎉 CONGRATULATIONS! 🎉", True, flash_color)
+            msg2 = font.render("YOU BROKE THE CEILING!", True, WHITE)
+            screen.blit(msg1, (DISP_W//2 - msg1.get_width()//2, DISP_H//2 - 60 + y_bounce))
+            screen.blit(msg2, (DISP_W//2 - msg2.get_width()//2, DISP_H//2 - 20))
+        else:
+            death_msg = "GAME OVER - Burned in Lava!" if (player.rect.bottom > lava_y) else "GAME OVER - ZAPPED by Laser!"
+            msg = font.render(death_msg, True, LASER_HOT)
+            screen.blit(msg, (DISP_W//2 - msg.get_width()//2, DISP_H//2 - 40))
+            
+        screen.blit(font.render("Press 'R' to Play Again", True, YELLOW), (DISP_W//2 - 140, DISP_H//2 + 40))
+
+    pygame.display.flip()
+    clock.tick(60)
